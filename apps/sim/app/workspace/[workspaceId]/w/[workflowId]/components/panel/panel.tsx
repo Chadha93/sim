@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createLogger } from '@sim/logger'
-import { ArrowUp, Square } from 'lucide-react'
+import { ArrowDown, ArrowRightLeft, ArrowUp, Square } from 'lucide-react'
 import { useParams, useRouter } from 'next/navigation'
 import {
   BubbleChatPreview,
@@ -23,6 +23,7 @@ import {
   Trash,
 } from '@/components/emcn'
 import { VariableIcon } from '@/components/icons'
+import { MigrationDialog } from '@/components/migration'
 import { useRegisterGlobalCommands } from '@/app/workspace/[workspaceId]/providers/global-commands-provider'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { createCommands } from '@/app/workspace/[workspaceId]/utils/commands-utils'
@@ -157,6 +158,9 @@ export function Panel() {
   const { isChatOpen, setIsChatOpen } = useChatStore()
   const { isOpen: isVariablesOpen, setIsOpen: setVariablesOpen } = useVariablesStore()
 
+  // Migration dialog state
+  const [isMigrationDialogOpen, setIsMigrationDialogOpen] = useState(false)
+
   const currentWorkflow = activeWorkflowId ? workflows[activeWorkflowId] : null
 
   /**
@@ -266,6 +270,18 @@ export function Panel() {
     router,
     workspaceId,
   ])
+
+  /**
+   * Handles importing workflow from JSON
+   */
+  const handleImportWorkflow = useCallback(() => {
+    if (!userPermissions.canEdit || isImporting) {
+      return
+    }
+    // Trigger file input click
+    fileInputRef.current?.click()
+    setIsMenuOpen(false)
+  }, [userPermissions.canEdit, isImporting])
 
   // Compute run button state
   const canRun = userPermissions.canRead // Running only requires read permissions
@@ -389,6 +405,13 @@ export function Panel() {
                     <span>Export workflow</span>
                   </PopoverItem>
                   <PopoverItem
+                    onClick={handleImportWorkflow}
+                    disabled={!userPermissions.canEdit || isImporting}
+                  >
+                    <ArrowDown className='h-3 w-3' />
+                    <span>Import workflow</span>
+                  </PopoverItem>
+                  <PopoverItem
                     onClick={handleDuplicateWorkflow}
                     disabled={!userPermissions.canEdit || isDuplicating}
                   >
@@ -413,6 +436,18 @@ export function Panel() {
                 onClick={() => setIsChatOpen(!isChatOpen)}
               >
                 <BubbleChatPreview />
+              </Button>
+              <Button
+                className='relative h-[30px] gap-1 rounded-[5px] px-2'
+                variant='default'
+                onClick={() => setIsMigrationDialogOpen(true)}
+                title='Migrate from n8n'
+              >
+                <ArrowRightLeft className='h-4 w-4' />
+                <span className='text-[12px]'>Migrate</span>
+                <span className='absolute -right-1 -top-1 rounded-[3px] bg-blue-500 px-1 text-[8px] font-semibold text-white'>
+                  BETA
+                </span>
               </Button>
             </div>
 
@@ -559,6 +594,107 @@ export function Panel() {
 
       {/* Floating Variables Modal */}
       <Variables />
+
+      {/* Hidden file input for importing workflows */}
+      <input
+        ref={fileInputRef}
+        type='file'
+        accept='.json,.zip'
+        multiple
+        className='hidden'
+        onChange={handleFileChange}
+      />
+
+      {/* Migration Dialog */}
+      <MigrationDialog
+        open={isMigrationDialogOpen}
+        onOpenChange={setIsMigrationDialogOpen}
+        onMigrationComplete={async (result) => {
+          if (!activeWorkflowId) {
+            logger.error('No active workflow ID found')
+            return
+          }
+
+          try {
+            logger.info('Starting migration completion...', {
+              blocksCount: Object.keys(result.state?.blocks || {}).length,
+              edgesCount: result.state?.edges?.length || 0,
+              workflowName: result.state?.metadata?.name,
+            })
+
+            // 1. Update workflow state in store (for immediate UI update)
+            useWorkflowStore.setState({
+              blocks: result.state?.blocks || {},
+              edges: result.state?.edges || [],
+              loops: result.state?.loops || {},
+              parallels: result.state?.parallels || {},
+            })
+
+            // 2. Save workflow state to database
+            const stateResponse = await fetch(`/api/workflows/${activeWorkflowId}/state`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                blocks: result.state?.blocks || {},
+                edges: result.state?.edges || [],
+                loops: result.state?.loops || {},
+                parallels: result.state?.parallels || {},
+                metadata: result.state?.metadata,
+                variables: result.state?.variables || [],
+              }),
+            })
+
+            if (!stateResponse.ok) {
+              const error = await stateResponse.text()
+              logger.error('Failed to save workflow state:', error)
+              throw new Error(`Failed to save workflow state: ${error}`)
+            }
+
+            logger.info('Workflow state saved successfully')
+
+            // 3. Update workflow name if available
+            if (result.state?.metadata?.name) {
+              // Update in registry for UI
+              useWorkflowRegistry.setState((state) => ({
+                workflows: {
+                  ...state.workflows,
+                  [activeWorkflowId]: {
+                    ...state.workflows[activeWorkflowId],
+                    name: result.state.metadata.name,
+                  },
+                },
+              }))
+
+              // Update in database
+              const nameResponse = await fetch(`/api/workflows/${activeWorkflowId}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: result.state.metadata.name }),
+              })
+
+              if (!nameResponse.ok) {
+                const error = await nameResponse.text()
+                logger.error('Failed to update workflow name:', error)
+                // Don't throw - name update is not critical
+              } else {
+                logger.info('Workflow name updated successfully:', result.state.metadata.name)
+              }
+            }
+
+            // 4. Apply auto layout to make the workflow visible
+            setTimeout(() => {
+              autoLayoutWithFitView()
+            }, 100)
+
+            setIsMigrationDialogOpen(false)
+            logger.info('Migration completed successfully')
+          } catch (error) {
+            logger.error('Failed to save migrated workflow:', error)
+            // Show error to user
+            alert(`Failed to save migrated workflow: ${error instanceof Error ? error.message : 'Unknown error'}`)
+          }
+        }}
+      />
     </>
   )
 }
